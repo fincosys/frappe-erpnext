@@ -1,0 +1,74 @@
+# Run bench commands on a Frappe Cloud PRIVATE bench from Actions: mint a 6 h SSH certificate via the
+# press API, resolve the current bench + proxy, feed the script over stdin (the FC proxy ignores remote
+# command arguments and blocks scp/rsync). Prefer the press API (sql/migrate/clear-cache) when it suffices.
+#
+# VARIABLES: FC_TEAM, FC_GROUP, FC_SITE     SECRETS: FC_API_KEY, FC_API_SECRET, FC_SSH_PRIVATE_KEY, FC_KNOWN_HOSTS (optional)
+# The public half of FC_SSH_PRIVATE_KEY must be registered as the DEFAULT SSH key of the FC user owning the API key.
+name: Frappe Cloud bench command
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: Bench script to run (multi-line ok). $SITE is exported.
+        type: string
+        default: |
+          bench version
+          bench --site $SITE execute frappe.db.count --args "['Bank Transaction', {'docstatus': 1}]"
+      use_press_sql:
+        description: Run a read-only SQL via press API instead of SSH
+        type: boolean
+        default: false
+      sql:
+        description: SQL for use_press_sql
+        type: string
+        default: "select status, count(*) n from `tabBank Transaction` where docstatus=1 group by status"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fc-ssh-${{ vars.FC_GROUP }}
+  cancel-in-progress: false
+
+jobs:
+  press-sql:
+    if: ${{ inputs.use_press_sql }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      FC_API_KEY: ${{ secrets.FC_API_KEY }}
+      FC_API_SECRET: ${{ secrets.FC_API_SECRET }}
+      FC_TEAM: ${{ vars.FC_TEAM }}
+      FC_SITE: ${{ vars.FC_SITE }}
+      SQL: ${{ inputs.sql }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash sync/fc_ssh.sh sql "$SQL" | tee result.json
+      - run: |
+          { echo '## press SQL'; echo '```json'; cat result.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  ssh:
+    if: ${{ !inputs.use_press_sql }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: erpnext-destructive           # required reviewers — SSH can write to the live DB
+    env:
+      FC_API_KEY: ${{ secrets.FC_API_KEY }}
+      FC_API_SECRET: ${{ secrets.FC_API_SECRET }}
+      FC_TEAM: ${{ vars.FC_TEAM }}
+      FC_GROUP: ${{ vars.FC_GROUP }}
+      FC_SITE: ${{ vars.FC_SITE }}
+      FC_SSH_PRIVATE_KEY: ${{ secrets.FC_SSH_PRIVATE_KEY }}
+      FC_KNOWN_HOSTS: ${{ secrets.FC_KNOWN_HOSTS }}
+      SCRIPT: ${{ inputs.script }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Certificate (reuse valid one, else mint; never stored — expires in 6 h)
+        run: bash sync/fc_ssh.sh cert
+      - name: Run over stdin
+        run: |
+          { echo "export SITE='$FC_SITE'"; printf '%s\n' "$SCRIPT"; } | bash sync/fc_ssh.sh run | tee bench-output.txt
+      - if: always()
+        run: |
+          { echo '## bench output'; echo '```'; tail -n 200 bench-output.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,133 @@
+# ERPNext sync — scheduled + manual, dry-run by default, destructive step gated by an environment.
+# Copy to .github/workflows/erpnext-sync.yml. Scripts live in sync/ (copy skill scripts/ there).
+#
+# Org/repo VARIABLES: ERPNEXT_URL          SECRETS: ERPNEXT_API_KEY, ERPNEXT_API_SECRET
+# Environment "erpnext-destructive": required reviewers, prevent self-review, protected branches only;
+# put the production ERPNEXT_API_SECRET there so it is only released after approval.
+name: ERPNext sync
+
+on:
+  schedule:
+    - cron: '17 2 * * *'            # 02:17 UTC daily; avoid :00 (congested, delayed). Optional: timezone: 'Africa/Johannesburg'
+  workflow_dispatch:
+    inputs:
+      doctype:
+        description: DocType to sync / audit
+        type: choice
+        options: [Customer, Supplier, Contact, Address, Item, "Item Price", "Bank Transaction", "Sales Invoice", "Purchase Invoice", "Payment Entry", "Journal Entry"]
+        default: Customer
+      mode:
+        description: audit (scan only) | apply-plan (execute a reviewed plan artifact)
+        type: choice
+        options: [audit, apply-plan]
+        default: audit
+      dry_run:
+        description: Plan only — write nothing to ERPNext
+        type: boolean
+        default: true
+      plan_run_id:
+        description: For apply-plan — run id whose plan artifact to apply
+        type: string
+        default: ''
+
+permissions:
+  contents: read                    # everything unspecified is none
+
+concurrency:
+  group: erpnext-sync-${{ inputs.doctype || 'Customer' }}
+  cancel-in-progress: false         # never kill a half-finished write
+
+env:
+  DOCTYPE: ${{ inputs.doctype || 'Customer' }}
+  MODE: ${{ inputs.mode || 'audit' }}
+  DRY_RUN: ${{ github.event_name == 'schedule' && 'true' || inputs.dry_run }}
+
+jobs:
+  audit:
+    if: ${{ (inputs.mode || 'audit') == 'audit' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7                      # pin to a full SHA in production
+      - uses: actions/setup-python@v7
+        with: { python-version: '3.12' }
+
+      - name: Census + scan
+        env:
+          ERPNEXT_URL: ${{ vars.ERPNEXT_URL }}
+          ERPNEXT_API_KEY: ${{ secrets.ERPNEXT_API_KEY }}
+          ERPNEXT_API_SECRET: ${{ secrets.ERPNEXT_API_SECRET }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python sync/frappe_client.py versions > out/versions.json
+          python sync/dedupe_audit.py census --out out/census.json
+          python sync/dedupe_audit.py scan "$DOCTYPE" --link-counts --out "out/plan-${DOCTYPE// /_}.json"
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: erpnext-plan-${{ github.run_id }}     # artifacts are immutable; unique per run
+          path: out/
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## ERPNext audit — $DOCTYPE"
+            echo
+            echo "| documents | clusters | in clusters | actions |"
+            echo "|---|---|---|---|"
+            jq -r '"| \(.stats.documents) | \(.stats.clusters) | \(.stats.documents_in_clusters) | \(.stats.actions | tostring) |"' "out/plan-${DOCTYPE// /_}.json" 2>/dev/null || echo "| – | – | – | – |"
+            echo
+            echo "Top DocTypes by count:"; echo
+            jq -r '.doctypes[:10][] | "- \(.doctype): \(.count // .error)"' out/census.json 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Destructive part: manual only, not dry-run, behind the environment gate (secrets released after approval).
+  apply:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'apply-plan' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: erpnext-destructive
+      url: ${{ vars.ERPNEXT_URL }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with: { python-version: '3.12' }
+      - uses: actions/download-artifact@v8
+        with:
+          name: erpnext-plan-${{ inputs.plan_run_id }}
+          run-id: ${{ inputs.plan_run_id }}
+          github-token: ${{ github.token }}
+          path: out/
+
+      - name: Apply reviewed plan
+        env:
+          ERPNEXT_URL: ${{ vars.ERPNEXT_URL }}
+          ERPNEXT_API_KEY: ${{ secrets.ERPNEXT_API_KEY }}
+          ERPNEXT_API_SECRET: ${{ secrets.ERPNEXT_API_SECRET }}   # environment-scoped secret
+        run: |
+          set -euo pipefail
+          plan="out/plan-${DOCTYPE// /_}.json"
+          args=(apply "$plan" --snapshot-dir snapshots/)
+          if [ "$DRY_RUN" != "true" ]; then args=(--apply "${args[@]}"); fi
+          python sync/dedupe_audit.py "${args[@]}"
+
+      - name: Keep snapshots + results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: erpnext-apply-${{ github.run_id }}
+          path: |
+            snapshots/
+            out/*.results.json
+          retention-days: 90
+
+      - if: always()
+        run: |
+          r="out/plan-${DOCTYPE// /_}.results.json"
+          { echo "## Apply — $DOCTYPE (dry_run=$DRY_RUN)"; echo; jq -r '.results | group_by(.status) | map("- \(.[0].status): \(length)") | .[]' "$r" 2>/dev/null; } >> "$GITHUB_STEP_SUMMARY"

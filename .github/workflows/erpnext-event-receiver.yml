@@ -1,0 +1,75 @@
+# Receive ERPNext events via repository_dispatch and fan them out (Cognitive Hub, issues, syncs).
+# Copy to .github/workflows/erpnext-event-receiver.yml in the receiver repo. The workflow file must be on
+# the DEFAULT branch for repository_dispatch to trigger it.
+#
+# Sender: an ERPNext Webhook (assets/specs/webhook-erpnext-to-github.json) posting
+#   POST https://api.github.com/repos/<org>/<repo>/dispatches  with a fine-grained PAT (Contents: write, this repo only)
+#   body {"event_type":"erpnext_event","client_payload":{...<=10 keys, <64KB...}}
+#
+# VARIABLES: ERPNEXT_URL, HUB_ENDPOINT (optional)   SECRETS: ERPNEXT_API_KEY, ERPNEXT_API_SECRET, HUB_TOKEN (optional)
+name: ERPNext event receiver
+
+on:
+  repository_dispatch:
+    types: [erpnext_event, erpnext_full_sync]      # == event_type values; omit `types` to accept all
+
+permissions:
+  contents: read
+  issues: write                                    # only if the "open issue" step is used
+
+concurrency:
+  group: erpnext-${{ github.event.client_payload.doctype }}-${{ github.event.client_payload.name }}
+  cancel-in-progress: false
+
+jobs:
+  handle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Never interpolate payload strings straight into `run:` — pass through env and quote.
+      EVENT_TYPE: ${{ github.event.action }}
+      DOCTYPE: ${{ github.event.client_payload.doctype }}
+      DOCNAME: ${{ github.event.client_payload.name }}
+      DOC_EVENT: ${{ github.event.client_payload.event }}
+      PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with: { python-version: '3.12' }
+
+      - name: Fetch the full document (payload carries identifiers only)
+        env:
+          ERPNEXT_URL: ${{ vars.ERPNEXT_URL }}
+          ERPNEXT_API_KEY: ${{ secrets.ERPNEXT_API_KEY }}
+          ERPNEXT_API_SECRET: ${{ secrets.ERPNEXT_API_SECRET }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$PAYLOAD" > payload.json
+          if [ "$DOC_EVENT" != "on_trash" ]; then
+            python sync/frappe_client.py get "$DOCTYPE" "$DOCNAME" --out doc.json
+          else
+            echo '{}' > doc.json
+          fi
+
+      - name: Forward to the Cognitive Hub (optional)
+        if: ${{ vars.HUB_ENDPOINT != '' }}
+        env:
+          HUB_ENDPOINT: ${{ vars.HUB_ENDPOINT }}
+          HUB_TOKEN: ${{ secrets.HUB_TOKEN }}
+        run: |
+          jq -n --slurpfile p payload.json --slurpfile d doc.json \
+             '{source:"erpnext", event:$p[0], doc:$d[0], received_at: (now|todate)}' > envelope.json
+          curl --fail-with-body -sS --retry 3 --retry-delay 5 --max-time 30 -X POST "$HUB_ENDPOINT" \
+               -H "Authorization: Bearer $HUB_TOKEN" -H "Content-Type: application/json" --data @envelope.json
+
+      - name: Open a GitHub issue for review-worthy events (example fan-out)
+        if: ${{ env.DOC_EVENT == 'on_cancel' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --title "ERPNext: $DOCTYPE $DOCNAME was cancelled" \
+                          --body "$(jq -r '"Event: \(.event)\nModified: \(.modified // "n/a")\n\n```json\n\(.|tostring)\n```"' payload.json)" \
+                          --label erpnext
+
+      - if: always()
+        run: echo "### $EVENT_TYPE → $DOCTYPE / $DOCNAME ($DOC_EVENT)" >> "$GITHUB_STEP_SUMMARY"

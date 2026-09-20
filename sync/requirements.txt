@@ -1,0 +1,4 @@
+# frappe_client.py, dedupe_audit.py, verify_signature.py and fc_ssh.sh are stdlib / bash+curl+jq only.
+# Only gh_app_token.py needs these:
+PyJWT>=2.8
+cryptography>=42
